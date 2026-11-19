@@ -1,79 +1,88 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// shots.js — deterministic scene staging for screenshots: a ?shot=
+// query param skips the title screen and places the player, cars, cops
+// and a mission exactly where the shot needs them.
+import { makeCar } from './vehicles.js';
+import { startMission } from './missions.js';
+import { setWanted } from './police.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function putPlayerInCar(state, modelName) {
+  const car = state.cars.find((c) => c.model === modelName && !c.isCop)
+    || state.cars.find((c) => !c.isCop && c.driver !== 'traffic');
+  if (!car) return;
+  const city = state.city;
+  // Start on the west side of a main road, heading east into the city,
+  // so the camera stays over streets, never over the empty edge.
+  car.x = city.roadsX[1]; car.y = city.roadsY[2];
+  car.angle = 0; car.speed = 240; car.parked = false; car.driver = 'player';
+  state.player.x = car.x; state.player.y = car.y;
+  state.player.inCar = car;
+  state.camera.x = car.x; state.camera.y = car.y;
+  // Keep pedestrians off the car's path so the staged drive is clean.
+  state.peds = state.peds.filter((p) => Math.abs(p.y - car.y) > 130 || p.x < car.x - 100);
+  return car;
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+function spawnChaseCops(state, n) {
+  const car = state.player.inCar || state.player;
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2 + 0.6;
+    const cop = makeCar(
+      car.x + Math.cos(a) * 420, car.y + Math.sin(a) * 320,
+      Math.atan2(car.y - (car.y + Math.sin(a) * 200), car.x - (car.x + Math.cos(a) * 260)),
+      { name: 'PD Interceptor', color: '#20242c', speed: 1.12 },
+      { driver: 'cop', isCop: true, stolen: true });
+    cop.speed = 300;
+    state.cars.push(cop);
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+export function applyShot(state, shot) {
+  const city = state.city;
+  state.mode = 'playing';
+  state.saveExists = false;
+  if (shot === 'chase') {
+    // Cover: driving fast, 3 wanted stars, two cop cars closing in,
+    // a mission objective and the minimap on the HUD.
+    const car = putPlayerInCar(state, 'Coast Coupe');
+    if (car) car.speed = 380;
+    setWanted(state, 3, 'The PD is on your tail!');
+    spawnChaseCops(state, 2);
+    startMission(state, 3);
+    state.mission.grabbed = true; // mid-escape, heading for Palm Park
+    state.message = 'The PD is on your tail — lose them and reach Palm Park!';
+    state.messageTimer = 4;
+    state.money = 1240;
+    state.player.health = 100;
+    state.autodrive = true;        // keep the getaway rolling for the shot
+    state.shotInvulnerable = true; // the cover star does not die mid-shot
+  } else if (shot === 'city') {
+    // On foot downtown: pedestrians, parked cars, a landmark, no heat.
+    state.player.x = city.roadsX[3] - 60;
+    state.player.y = city.roadsY[1] + 60;
+    state.player.angle = Math.PI / 4;
+    state.camera.x = state.player.x; state.camera.y = state.player.y;
+    state.money = 210;
+    startMission(state, 0);
+  } else if (shot === 'drive') {
+    // Cruising with traffic on a main road, mission 3 in progress.
+    const car = putPlayerInCar(state, 'Sunrunner');
+    if (car) car.speed = 300;
+    state.money = 480;
+    state.autodrive = true;
+    startMission(state, 2);
+    state.mission.hasPassenger = true;
+    state.message = 'Marco is in — drive him to the Sunset Garage!';
+    state.messageTimer = 4;
+  } else if (shot === 'mission') {
+    // Job 1 in progress on foot, waypoint beacon at Cafe Luna.
+    state.player.x = city.roadsX[1] - 40;
+    state.player.y = city.roadsY[0] + 120;
+    state.player.angle = 0;
+    state.camera.x = state.player.x; state.camera.y = state.player.y;
+    state.money = 150;
+    startMission(state, 0);
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  // Let the world settle one tick so traffic and peds spread out.
+  state.camera.x = (state.player.inCar || state.player).x;
+  state.camera.y = (state.player.inCar || state.player).y;
 }
